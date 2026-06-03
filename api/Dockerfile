@@ -1,23 +1,30 @@
 # --- STAGE 1: Builder ---
 FROM node:20-alpine AS builder
-WORKDIR /usr/src/app
+WORKDIR /usr/src
 
-# Leverage layer caching for node_modules
+# Copy all project manifests
 COPY package*.json ./
-RUN npm ci --only=production
+COPY api/package*.json ./api/
+COPY worker/package*.json ./worker/
+COPY shared/package*.json ./shared/
+
+# Run clean install globally across all registered workspaces
+RUN npm ci --omit=dev
 
 # --- STAGE 2: Runner ---
 FROM node:20-alpine AS runner
-WORKDIR /usr/src/app
+WORKDIR /usr/src
 
 ENV NODE_ENV=production
 
-# Copy only production dependencies from builder stage
-COPY --from=builder /usr/src/app/node_modules ./node_modules
-# Copy application source code
-COPY . .
+# Copy the complete, unified node_modules tree
+COPY --from=builder /usr/src/node_modules ./node_modules
+
+# Copy app source and shared business code
+COPY api/ ./api/
+COPY shared/ ./shared/
 
 USER node
 EXPOSE 8080
 
-CMD ["node", "server.js"]
+CMD ["node", "api/server.js"]

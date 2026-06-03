@@ -1,0 +1,9 @@
+{
+  "name": "@engine/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "config/redis.js",
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}
