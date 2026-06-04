@@ -1,10 +1,14 @@
 import express from 'express';
 import { createRedisClient } from '../shared/config/redis.js';
+import notificationRoutes from './src/routes/notificationRoutes.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(express.json());
+
+// Mount notification ingestion routes
+app.use('/api/v1/notifications', notificationRoutes);
 
 // Initialize a dedicated client for our Producer API operations
 const redisProducerClient = createRedisClient('producer_api');
