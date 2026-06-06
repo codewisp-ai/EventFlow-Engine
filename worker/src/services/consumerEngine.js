@@ -4,62 +4,68 @@ import { processNotificationJob } from '../processors/notificationProcessor.js';
 const redis = createRedisClient('consumer_worker_stream');
 
 const STREAM_KEY = 'notifications:stream';
+const DLQ_STREAM_KEY = 'notifications:dlq';
 const CONSUMER_GROUP = 'notification_workers_group';
 const CONSUMER_NAME = process.env.HOSTNAME || 'worker_node_alpha';
 
-/**
- * Ensures our named Consumer Group exists within the Redis Stream boundary.
- * Connection-aware wrapper to eliminate Docker container startup race conditions.
- */
+const MAX_ATTEMPTS = 3;
+
 export const initializeConsumerGroup = () => {
   return new Promise((resolve, reject) => {
-    
-    // Internal function execution logic once connection is verified writeable
     const executeGroupCreation = async () => {
       try {
         await redis.xgroup('CREATE', STREAM_KEY, CONSUMER_GROUP, '$', 'MKSTREAM');
-        console.log(`[Consumer Engine] Consumer group [${CONSUMER_GROUP}] established successfully.`);
+        console.log(`[Consumer Engine] Consumer group [${CONSUMER_GROUP}] verified/established.`);
         resolve();
       } catch (error) {
         if (error.message.includes('BUSYGROUP')) {
-          console.log(`[Consumer Engine] Consumer group [${CONSUMER_GROUP}] verified active.`);
           resolve();
         } else {
-          console.error('[Consumer Engine] Critical group initialization failure:', error.message);
           reject(error);
         }
       }
     };
 
-    // If the socket connection is already open and writeable, run immediately
     if (redis.status === 'ready') {
       executeGroupCreation();
     } else {
-      // Otherwise, subscribe to the ioredis ready event before executing commands
-      redis.once('ready', () => {
-        console.log('[Consumer Engine] Redis client status verified READY. Proceeding with setup...');
-        executeGroupCreation();
-      });
-
-      // Fail fast if the client throws an error during the connection handshake phase
-      redis.once('error', (err) => {
-        reject(new Error(`Redis connection dropped during initial engine boot handshake: ${err.message}`));
-      });
+      redis.once('ready', executeGroupCreation);
     }
   });
 };
 
 /**
- * Continuous blocking poll loop execution engine.
+ * Routes a permanently broken notification job to the Dead Letter Queue stream buffer.
  */
+const routeToDeadLetterQueue = async (messageId, type, payload, errorMessage) => {
+  console.error(`[DLQ Router] CRITICAL: Job ID ${messageId} reached max retries. Routing to DLQ...`);
+  
+  try {
+    await redis.xadd(
+      DLQ_STREAM_KEY,
+      'MAXLEN', '~', 50000, // Keep DLQ bounded to save memory caps
+      '*',
+      'originalJobId', messageId,
+      'type', type,
+      'payload', JSON.stringify(payload),
+      'failedAt', Date.now().toString(),
+      'errorReason', errorMessage
+    );
+    console.log(`[DLQ Router] Job ID ${messageId} successfully isolated in ${DLQ_STREAM_KEY}`);
+  } catch (dlqError) {
+    console.error('[DLQ Router] CRITICAL EXCEPTION: Failed to write to DLQ stream:', dlqError.message);
+  }
+};
+
 export const startConsumerLoop = async () => {
-  console.log(`[Consumer Engine] Poller active. Listening as node: ${CONSUMER_NAME}`);
+  console.log(`[Consumer Engine] Resilient poller active. Listening as: ${CONSUMER_NAME}`);
 
   while (true) {
+    let currentMessageId = null;
+    let notificationType = null;
+    let payload = null;
+
     try {
-      // XREADGROUP COUNT 1 BLOCK 2000 STREAMS notifications:stream >
-      // '>' means: Give me messages that have NEVER been delivered to any other consumer.
-      // BLOCK 2000 means: If no messages are there, hold the connection open for 2 seconds before recycling.
       const result = await redis.xreadgroup(
         'GROUP', CONSUMER_GROUP, CONSUMER_NAME,
         'COUNT', '1',
@@ -68,35 +74,57 @@ export const startConsumerLoop = async () => {
         '>'
       );
 
-      // If the result array is null or empty, the block timed out with no new items. Continue polling.
       if (!result || result.length === 0) continue;
 
-      const [streamName, messages] = result[0];
+      const [_, messages] = result[0];
       const [messageId, fieldsArray] = messages[0];
+      currentMessageId = messageId;
 
-      // Reconstruct the flat array ['type', 'email', 'payload', '...'] into a clean JavaScript Object
+      // Unpack flat Redis Stream array into object structures
       const fields = {};
       for (let i = 0; i < fieldsArray.length; i += 2) {
         fields[fieldsArray[i]] = fieldsArray[i + 1];
       }
 
-      const notificationType = fields.type;
-      const payload = JSON.parse(fields.payload);
+      notificationType = fields.type;
+      payload = JSON.parse(fields.payload);
 
-      console.log(`[Consumer Engine] Acquired Job ID: ${messageId}. Processing...`);
+      // Track execution attempts using a Redis tracking key specific to this message ID
+      const trackingKey = `job:attempts:${messageId}`;
+      const attempts = await redis.incr(trackingKey);
+      await redis.expire(trackingKey, 86400); // 24-hour expiration safety valve
 
-      // Pass the job to our dedicated processor strategy
-      await processNotificationJob(notificationType, payload);
+      console.log(`[Consumer Engine] Processing Job ID: ${messageId} (Attempt ${attempts}/${MAX_ATTEMPTS})`);
 
-      // THE HANDSHAKE SETTLEMENT --------------------------------------
-      // Acknowledge the message was processed cleanly to remove it from our PEL
-      await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
-      console.log(`[Consumer Engine] Job ID: ${messageId} successfully SETTLED (XACK).`);
+      try {
+        // Execute core business processor block inside a secondary execution sandbox
+        await processNotificationJob(notificationType, payload);
 
-    } catch (error) {
-      console.error('[Consumer Engine Loop Error]: Failed to handle stream element.', error.message);
-      // Backoff briefly on error to avoid spinning aggressively if infrastructure issues arise
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Success: Clean settlement handshake
+        await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
+        await redis.del(trackingKey); // Clean up the tracking counter key
+        console.log(`[Consumer Engine] Job ID: ${messageId} processed and settled cleanly (XACK).`);
+
+      } catch (jobExecutionError) {
+        console.error(`[Consumer Engine] Execution failure on Job ID ${messageId}:`, jobExecutionError.message);
+
+        if (attempts >= MAX_ATTEMPTS) {
+          // Max attempts reached: Route payload to the DLQ stream
+          await routeToDeadLetterQueue(messageId, notificationType, payload, jobExecutionError.message);
+          
+          // Settle the job out of the main queue's PEL to prevent it from getting stuck forever
+          await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
+          await redis.del(trackingKey);
+        } else {
+          // Re-throw the error to trigger our loop back-off without acknowledging the item
+          throw jobExecutionError;
+        }
+      }
+
+    } catch (loopError) {
+      console.error('[Consumer Engine Loop Backoff]:', loopError.message);
+      // Wait briefly before reclaiming to avoid hammering infrastructure during systemic errors
+      await new Promise((resolve) => setTimeout(resolve, 1500));
     }
   }
 };
