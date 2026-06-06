@@ -41,7 +41,7 @@ services:
     build:
       context: .
       dockerfile: ./worker/Dockerfile
-    container_name: engine_consumer_worker_1
+    # REMOVED custom container_name to allow dynamic scaling allocation as docker handle container names when scaling
     restart: always
     environment:
       - REDIS_URL=redis://redis_broker:6379
