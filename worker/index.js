@@ -1,4 +1,5 @@
 import { initializeConsumerGroup, startConsumerLoop } from './src/services/consumerEngine.js';
+import { startRecoveryAgent } from './src/services/recoveryService.js';
 
 console.log('[Worker] Launching headless consumer background processes...');
 
@@ -6,6 +7,9 @@ const startWorkerContext = async () => {
   try {
     // 1. Establish structural cluster group state
     await initializeConsumerGroup();
+
+    // 2. Launch autonomous stalled job recovery loop agent (runs on background timer)
+    startRecoveryAgent();
 
     // 2. Fire up the non-blocking infinite polling engine loop
     startConsumerLoop();
