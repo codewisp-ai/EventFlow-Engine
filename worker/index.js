@@ -1,5 +1,6 @@
 import { initializeConsumerGroup, startConsumerLoop } from './src/services/consumerEngine.js';
 import { startRecoveryAgent } from './src/services/recoveryService.js';
+import { startSchedulerDaemon } from './src/services/schedulerService.js';
 
 console.log('[Worker] Launching headless consumer background processes...');
 
@@ -11,7 +12,10 @@ const startWorkerContext = async () => {
     // 2. Launch autonomous stalled job recovery loop agent (runs on background timer)
     startRecoveryAgent();
 
-    // 2. Fire up the non-blocking infinite polling engine loop
+    // 3. Launch delay scheduling daemon thread
+    startSchedulerDaemon();
+    
+    // 4. Fire up the non-blocking infinite polling engine loop
     startConsumerLoop();
     
   } catch (error) {
