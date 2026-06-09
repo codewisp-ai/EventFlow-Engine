@@ -47,22 +47,87 @@ The system is built around four strict principles:
 
 VortexMQ is composed of **four independent infrastructure tiers**. Each tier has strictly bounded responsibilities and communicates only through well-defined interfaces.
 
+```mermaid
+graph TD
+    %% ── Entry Point ──────────────────────────────────────────
+    Start((START))
+    Input[/"User Request\n+ Payload"/]
+
+    %% ── Tier 1: Producer API ─────────────────────────────────
+    SchemaVal[Schema Validation]
+    ProducerAPI[Producer API\nExpress · Socket.IO]
+
+    %% ── Tier 2: Redis Broker ─────────────────────────────────
+    RedisStream[(Redis Stream\nXADD · MAXLEN 100k)]
+    ZSET[(ZSET\nDelay Buffer)]
+    DLQ[(Dead Letter\nQueue Stream)]
+
+    %% ── Tier 3: Worker Nodes ─────────────────────────────────
+    ConsumerGroup[Consumer Group\nXREADGROUP]
+    WorkerNode[Worker Node\nJob Processor]
+    RecoveryAgent[Recovery Agent\nXAUTOCLAIM · 30s]
+    Scheduler[Scheduler Process\nZRANGEBYSCORE · 1s]
+
+    %% ── Tier 4: Observability ────────────────────────────────
+    Prometheus[Prometheus\nScrape · 5s]
+    Grafana[Grafana\nDashboard]
+
+    %% ── WebSocket Feedback ───────────────────────────────────
+    PubSub{{Redis Pub/Sub\njob:status:updates}}
+    WSClient[/"Client\nWebSocket Update"/]
+
+    %% ── Flow ─────────────────────────────────────────────────
+    Start --> Input
+    Input --> SchemaVal
+    SchemaVal -->|Valid payload| ProducerAPI
+    ProducerAPI -->|XADD O(1)| RedisStream
+    ProducerAPI -->|202 Accepted + jobId| WSClient
+
+    RedisStream --> ConsumerGroup
+    ConsumerGroup --> WorkerNode
+
+    WorkerNode -->|Success → XACK| RedisStream
+    WorkerNode -->|Failure: attempt < 5\nExponential Backoff + Jitter| ZSET
+    WorkerNode -->|Failure: attempt = 5| DLQ
+
+    ZSET -->|Due jobs\nZRANGEBYSCORE| Scheduler
+    Scheduler -->|Re-inject| RedisStream
+
+    RecoveryAgent -->|Stalled > 60s\nSteal from PEL| ConsumerGroup
+
+    WorkerNode -->|Status update| PubSub
+    PubSub -->|Relay event| ProducerAPI
+    ProducerAPI -->|job_update emit| WSClient
+
+    WorkerNode -->|Metrics export\nport 9100| Prometheus
+    Prometheus --> Grafana
+
+    %% ── Styling ──────────────────────────────────────────────
+    classDef tier1   fill:#f9a8d4,stroke:#be185d,stroke-width:1.5px,color:#500724;
+    classDef tier2   fill:#a5f3fc,stroke:#0e7490,stroke-width:1.5px,color:#083344;
+    classDef tier3   fill:#bbf7d0,stroke:#15803d,stroke-width:1.5px,color:#14532d;
+    classDef tier4   fill:#fde68a,stroke:#b45309,stroke-width:1.5px,color:#451a03;
+    classDef io      fill:#e2e8f0,stroke:#64748b,stroke-width:1px,color:#1e293b;
+    classDef broker  fill:#c7d2fe,stroke:#4338ca,stroke-width:1.5px,color:#1e1b4b;
+    classDef pubsub  fill:#fcd34d,stroke:#92400e,stroke-width:1.5px,color:#451a03;
+
+    class ProducerAPI,SchemaVal tier1;
+    class RedisStream,ZSET,DLQ broker;
+    class ConsumerGroup,WorkerNode,RecoveryAgent,Scheduler tier3;
+    class Prometheus,Grafana tier4;
+    class Start,Input,WSClient io;
+    class PubSub pubsub;
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          VORTEXMQ SYSTEM OVERVIEW                           │
-├──────────────────┬──────────────────┬──────────────────┬────────────────────┤
-│   TIER 1         │   TIER 2         │   TIER 3         │   TIER 4           │
-│   Producer API   │   Redis Broker   │   Worker Nodes   │   Observability    │
-│   (Ingestion)    │   (Streams)      │   (Consumers)    │   (Metrics)        │
-├──────────────────┼──────────────────┼──────────────────┼────────────────────┤
-│  Express HTTP    │  Redis Streams   │  Consumer Group  │  prom-client       │
-│  Socket.IO       │  Consumer Groups │  Processor Logic │  Prometheus        │
-│  Schema Validate │  ZSET Delay Q    │  Recovery Agent  │  Grafana           │
-│  Redis Pub/Sub   │  DLQ Stream      │  Scheduler Loop  │                    │
-│  Sub Listener    │  PEL Tracking    │  Redis Pub/Sub   │                    │
-│                  │                  │  Pub Publisher   │                    │
-└──────────────────┴──────────────────┴──────────────────┴────────────────────┘
-```
+
+### Legend
+
+| Color | Tier | Responsibility |
+|---|---|---|
+| 🩷 Pink | **Tier 1 — Producer API** | HTTP ingestion, schema validation, WebSocket gateway |
+| 🟣 Indigo | **Tier 2 — Redis Broker** | Streams, ZSET delay buffer, Dead Letter Queue |
+| 🟢 Green | **Tier 3 — Worker Nodes** | Job execution, retry logic, recovery, scheduling |
+| 🟡 Yellow | **Tier 4 — Observability** | Prometheus scraping, Grafana dashboards |
+| 🟠 Amber | **Pub/Sub Bus** | Cross-container real-time status bridge |
 
 ### Tier 1 — Stateless Producer API
 
@@ -89,7 +154,7 @@ Independent, containerized background workers that pull jobs via `XREADGROUP`. E
 - Manages its own retry state and backoff calculations
 - Coordinates with sibling workers through the Consumer Group (zero duplicate processing)
 - Publishes status updates to the Redis Pub/Sub bus
-- Runs a background **Recovery Agent** (XAUTOCLAIM) and **Scheduler Process** (ZRANGEBYSCORE) as daemon threads
+- Runs a background **Recovery Agent** (`XAUTOCLAIM`) and **Scheduler Process** (`ZRANGEBYSCORE`) as daemon threads
 
 ### Tier 4 — Monitoring & Telemetry
 
@@ -99,69 +164,60 @@ A full production observability plane using a **pull model** — zero write over
 
 ## 🔄 End-to-End Data Lifecycle
 
-### The Happy Path
+### 1. The Happy Path
 
-```
-  CLIENT                  PRODUCER API              REDIS BROKER           WORKER NODE
-    │                          │                          │                      │
-    │  POST /trigger            │                          │                      │
-    │ ─────────────────────────►│                          │                      │
-    │                          │  Schema Validation        │                      │
-    │                          │ ─────────────────────────►│                      │
-    │                          │  XADD (append job)        │                      │
-    │                          │◄─────────────────────────►│                      │
-    │  202 Accepted + jobId     │                          │                      │
-    │◄─────────────────────────│                          │                      │
-    │                          │                          │  XREADGROUP (poll)   │
-    │                          │                          │◄─────────────────────│
-    │                          │                          │  Deliver job entry   │
-    │                          │                          │─────────────────────►│
-    │                          │                          │                      │  Execute job
-    │                          │                          │                      │ ──────────────
-    │                          │                          │  XACK (acknowledge)  │
-    │                          │                          │◄─────────────────────│
-    │                          │  Pub/Sub: 'delivered'    │                      │
-    │◄─ WS: job_update ────────│◄─────────────────────────────────────────────── │
-    │   status: 'delivered'    │                          │                      │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C  as 🌐 Client
+    participant A  as 🟥 Producer API
+    participant R  as 🟦 Redis Stream
+    participant W  as 🟩 Worker Node
+
+    C->>A: POST /api/v1/notifications/trigger
+    A->>A: Schema Validation
+    A->>R: XADD (append job) O(1)
+    A-->>C: 202 Accepted + jobId
+
+    W->>R: XREADGROUP (poll for jobs)
+    R-->>W: Deliver job entry
+    Note over W: Execute job processor
+    W->>R: XACK (acknowledge success)
+    W->>A: Pub/Sub publish · status = delivered
+    A-->>C: WS job_update · status: "delivered"
 ```
 
 ---
 
-### The Failure & Retry Path
+### 2. The Failure & Retry Path
 
-```
-  WORKER NODE              REDIS ZSET              SCHEDULER              REDIS STREAM
-      │                  (Delay Buffer)              (1s loop)                  │
-      │                        │                        │                       │
-      │  Job fails (attempt 1) │                        │                       │
-      │ ───────────────────────►                        │                       │
-      │  score = now() + delay(1)                       │                       │
-      │  delay = min(1s × 2¹ + jitter, maxDelay)        │                       │
-      │                        │                        │                       │
-      │  Job fails (attempt 2) │                        │                       │
-      │ ───────────────────────►                        │                       │
-      │  score = now() + delay(2)                       │                       │
-      │  delay = min(1s × 2² + jitter, maxDelay)        │                       │
-      │                        │                        │                       │
-      │                        │  ZRANGEBYSCORE         │                       │
-      │                        │  (score ≤ now())       │                       │
-      │                        │◄───────────────────────│                       │
-      │                        │  Returns due jobs      │                       │
-      │                        │───────────────────────►│                       │
-      │                        │                        │  XADD re-inject       │
-      │                        │                        │──────────────────────►│
-      │                        │                        │                       │
-      │ ◄────────────────────────────────────── XREADGROUP delivers re-queued job
-      │                        │                        │                       │
-      │  [Attempt 5 fails]     │                        │                       │
-      │ ──► Move to DLQ Stream ──────────────────────────────────────────────── ►│ (DLQ)
-      │ ──► XACK original entry                         │                       │
-      │ ──► Pub/Sub: 'failed_dlq'                       │                       │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W  as 🟩 Worker Node
+    participant Z  as 🟧 Redis ZSET<br/>(Delay Buffer)
+    participant S  as ⚙️ Scheduler<br/>(1s loop)
+    participant R  as 🟦 Redis Stream
+    participant D  as 💀 DLQ Stream
+
+    W->>Z: Attempt 1 fails · ZADD score=now+2s
+    W->>Z: Attempt 2 fails · ZADD score=now+4s
+    W->>Z: Attempt 3 fails · ZADD score=now+8s
+    W->>Z: Attempt 4 fails · ZADD score=now+16s
+
+    loop Every 1 second
+        S->>Z: ZRANGEBYSCORE (score ≤ now)
+        Z-->>S: Return due jobs
+        S->>R: XADD re-inject job
+        R-->>W: XREADGROUP re-delivers
+    end
+
+    W->>D: Attempt 5 fails · move to DLQ
+    W->>R: XACK original entry
+    W->>W: Pub/Sub publish · status = failed_dlq
 ```
 
-**Backoff Formula:**
-
-$$\text{Delay} = \min\left(\text{BaseDelay} \times 2^{\text{attempt}} + \text{rand(0, Jitter)},\ \text{MaxDelay}\right)$$
+**Backoff Formula:** `Delay = min(BaseDelay × 2^attempt + rand(Jitter), MaxDelay)`
 
 | Attempt | Approx. Delay | Behavior |
 |---------|--------------|----------|
@@ -173,37 +229,47 @@ $$\text{Delay} = \min\left(\text{BaseDelay} \times 2^{\text{attempt}} + \text{ra
 
 ---
 
-### The Crash Recovery Path
+### 3. The Crash Recovery Path
 
-```
-  WORKER (crashed)         PEL (Redis)           RECOVERY AGENT          HEALTHY WORKER
-        │                      │                  (every 30s)                   │
-        │  Job delivered        │                      │                         │
-        │──────────────────────►│                      │                         │
-        │  [Worker crashes]     │                      │                         │
-        ✕                       │  Job sits in PEL     │                         │
-                                │  idle > 60s          │                         │
-                                │                      │  XAUTOCLAIM             │
-                                │◄─────────────────────│  (idle_time > 60000ms)  │
-                                │  Transfer ownership  │                         │
-                                │──────────────────────────────────────────────► │
-                                │                      │                         │  Re-process job
-                                │                      │                         │ ────────────────
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W1 as 💥 Worker (crashed)
+    participant P  as 🟦 PEL (Redis)
+    participant RA as 🔄 Recovery Agent<br/>(every 30s)
+    participant W2 as 🟩 Healthy Worker
+
+    W1->>P: Job delivered · enters PEL
+    Note over W1: Worker crashes mid-execution
+    Note over P: Job sits idle in PEL > 60s
+
+    loop Every 30 seconds
+        RA->>P: XAUTOCLAIM (idle_time > 60000ms)
+        P-->>RA: Transfer ownership of stalled jobs
+        RA->>W2: Re-deliver to healthy consumer
+    end
+
+    Note over W2: Re-processes job normally
+    W2->>P: XACK on completion
 ```
 
 ---
 
-### The Real-Time WebSocket Bridge
+### 4. The Real-Time WebSocket Bridge
 
-```
-  WORKER CONTAINER           REDIS PUB/SUB             API CONTAINER         BROWSER CLIENT
-         │                  (job:status:updates)             │                      │
-         │  PUBLISH status update                            │                      │
-         │─────────────────────────────────────────────────► │                      │
-         │                                                   │  socket.emit()       │
-         │                                                   │─────────────────────►│
-         │                                                   │                      │  Live UI update
-         │                                                   │                      │ ─────────────
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W  as 🟩 Worker Container
+    participant PS as 🟠 Redis Pub/Sub<br/>job:status:updates
+    participant A  as 🟥 API Container
+    participant B  as 🌐 Browser Client
+
+    Note over W,B: Separate Docker containers · no shared memory
+    W->>PS: PUBLISH · jobId + status
+    PS-->>A: SUB delivers event
+    A->>B: socket.emit("job_update") · sub-100ms
+    Note over B: Live UI status update
 ```
 
 This cross-container bridge is critical. Workers and the Socket.IO server are in **separate Docker containers** with no shared memory. Redis Pub/Sub is the messaging fabric that lets headless workers push sub-100ms status updates directly to browser clients.
@@ -386,21 +452,21 @@ API liveness probe.
 
 **Status State Machine:**
 
-```
-                    ┌─────────────┐
-         ┌──────────│  processing │──────────┐
-         │          └─────────────┘          │
-         │ (failure)                         │ (success)
-         ▼                                   ▼
-  ┌─────────────┐                    ┌─────────────┐
-  │  retrying   │                    │  delivered  │
-  └─────────────┘                    └─────────────┘
-         │
-         │ (attempt 5 exhausted)
-         ▼
-  ┌─────────────┐
-  │ failed_dlq  │
-  └─────────────┘
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> processing : Job accepted\n& queued
+
+    processing --> delivered  : ✅ Success\nXACK + clear counter
+    processing --> retrying   : ❌ Failure\nattempt < 5
+
+    retrying --> processing   : ⏱ Backoff elapsed\nScheduler re-injects
+
+    retrying --> failed_dlq   : 💀 Attempt 5\nexhausted
+
+    delivered --> [*]
+    failed_dlq --> [*]
 ```
 
 ---
