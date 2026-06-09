@@ -49,66 +49,57 @@ VortexMQ is composed of **four independent infrastructure tiers**. Each tier has
 
 ```mermaid
 graph TD
-    %% ── Entry Point ──────────────────────────────────────────
     Start((START))
-    Input[/"User Request\n+ Payload"/]
+    Input[/"User Request + Payload"/]
 
-    %% ── Tier 1: Producer API ─────────────────────────────────
     SchemaVal[Schema Validation]
-    ProducerAPI[Producer API\nExpress · Socket.IO]
+    ProducerAPI["Producer API — Express + Socket.IO"]
 
-    %% ── Tier 2: Redis Broker ─────────────────────────────────
-    RedisStream[(Redis Stream\nXADD · MAXLEN 100k)]
-    ZSET[(ZSET\nDelay Buffer)]
-    DLQ[(Dead Letter\nQueue Stream)]
+    RedisStream[("Redis Stream — XADD MAXLEN 100k")]
+    ZSET[("ZSET — Delay Buffer")]
+    DLQ[("Dead Letter Queue Stream")]
 
-    %% ── Tier 3: Worker Nodes ─────────────────────────────────
-    ConsumerGroup[Consumer Group\nXREADGROUP]
-    WorkerNode[Worker Node\nJob Processor]
-    RecoveryAgent[Recovery Agent\nXAUTOCLAIM · 30s]
-    Scheduler[Scheduler Process\nZRANGEBYSCORE · 1s]
+    ConsumerGroup["Consumer Group — XREADGROUP"]
+    WorkerNode["Worker Node — Job Processor"]
+    RecoveryAgent["Recovery Agent — XAUTOCLAIM 30s"]
+    Scheduler["Scheduler Process — ZRANGEBYSCORE 1s"]
 
-    %% ── Tier 4: Observability ────────────────────────────────
-    Prometheus[Prometheus\nScrape · 5s]
-    Grafana[Grafana\nDashboard]
+    Prometheus["Prometheus — Scrape 5s"]
+    Grafana["Grafana Dashboard"]
 
-    %% ── WebSocket Feedback ───────────────────────────────────
-    PubSub{{Redis Pub/Sub\njob:status:updates}}
-    WSClient[/"Client\nWebSocket Update"/]
+    PubSub{{"Redis Pub/Sub — job:status:updates"}}
+    WSClient[/"Client — WebSocket Update"/]
 
-    %% ── Flow ─────────────────────────────────────────────────
     Start --> Input
     Input --> SchemaVal
     SchemaVal -->|Valid payload| ProducerAPI
-    ProducerAPI -->|XADD O(1)| RedisStream
+    ProducerAPI -->|XADD| RedisStream
     ProducerAPI -->|202 Accepted + jobId| WSClient
 
     RedisStream --> ConsumerGroup
     ConsumerGroup --> WorkerNode
 
-    WorkerNode -->|Success → XACK| RedisStream
-    WorkerNode -->|Failure: attempt < 5\nExponential Backoff + Jitter| ZSET
-    WorkerNode -->|Failure: attempt = 5| DLQ
+    WorkerNode -->|Success — XACK| RedisStream
+    WorkerNode -->|Failure attempt less than 5 — Backoff + Jitter| ZSET
+    WorkerNode -->|Failure attempt 5| DLQ
 
-    ZSET -->|Due jobs\nZRANGEBYSCORE| Scheduler
-    Scheduler -->|Re-inject| RedisStream
+    ZSET -->|Due jobs — ZRANGEBYSCORE| Scheduler
+    Scheduler -->|Re-inject to stream| RedisStream
 
-    RecoveryAgent -->|Stalled > 60s\nSteal from PEL| ConsumerGroup
+    RecoveryAgent -->|Stalled over 60s — steal from PEL| ConsumerGroup
 
     WorkerNode -->|Status update| PubSub
     PubSub -->|Relay event| ProducerAPI
     ProducerAPI -->|job_update emit| WSClient
 
-    WorkerNode -->|Metrics export\nport 9100| Prometheus
+    WorkerNode -->|Metrics export port 9100| Prometheus
     Prometheus --> Grafana
 
-    %% ── Styling ──────────────────────────────────────────────
     classDef tier1   fill:#f9a8d4,stroke:#be185d,stroke-width:1.5px,color:#500724;
-    classDef tier2   fill:#a5f3fc,stroke:#0e7490,stroke-width:1.5px,color:#083344;
+    classDef broker  fill:#c7d2fe,stroke:#4338ca,stroke-width:1.5px,color:#1e1b4b;
     classDef tier3   fill:#bbf7d0,stroke:#15803d,stroke-width:1.5px,color:#14532d;
     classDef tier4   fill:#fde68a,stroke:#b45309,stroke-width:1.5px,color:#451a03;
     classDef io      fill:#e2e8f0,stroke:#64748b,stroke-width:1px,color:#1e293b;
-    classDef broker  fill:#c7d2fe,stroke:#4338ca,stroke-width:1.5px,color:#1e1b4b;
     classDef pubsub  fill:#fcd34d,stroke:#92400e,stroke-width:1.5px,color:#451a03;
 
     class ProducerAPI,SchemaVal tier1;
