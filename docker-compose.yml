@@ -37,18 +37,43 @@ services:
     networks:
       - broker_mesh
 
+   
+  
   consumer_worker:
     build:
       context: .
       dockerfile: ./worker/Dockerfile
-    # REMOVED custom container_name to allow dynamic scaling allocation as docker handle container names when scaling
     restart: always
+    ports:
+      - "9100:9100" # Expose telemetry endpoint to internal mesh
+       # REMOVED custom container_name to allow dynamic scaling allocation as docker handle container names when scaling
+
     environment:
       - REDIS_URL=redis://redis_broker:6379
       - NODE_ENV=development
     depends_on:
       redis_broker:
         condition: service_healthy
+    networks:
+      - broker_mesh
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: engine_prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - broker_mesh
+
+  grafana:
+    image: grafana/grafana:10.0.3
+    container_name: engine_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # Default developer validation gate credentials
     networks:
       - broker_mesh
 

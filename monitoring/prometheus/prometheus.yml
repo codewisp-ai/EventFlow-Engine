@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s # High-frequency scrape rate for rapid verification loops
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'vortex_mq_workers'
+    static_configs:
+      # Targets map straight to our container hostname across the internal network mesh
+      - targets: ['consumer_worker:9100']

@@ -61,8 +61,26 @@ const routeToDeadLetterQueue = async (messageId, type, payload, errorMessage) =>
   );
 };
 
+
+
+/**
+ * Periodically queries Redis to update the live DLQ depth gauge telemetry metric.
+ */
+const updateDlqMetrics = async () => {
+  try {
+    const streamInfo = await redis.xinfo('STREAM', DLQ_STREAM_KEY).catch(() => null);
+    const depth = streamInfo ? streamInfo.length : 0;
+    dlqDepthGauge.set(depth);
+  } catch (err) {
+    // Suppress errors if DLQ stream doesn't exist on Redis yet
+  }
+};
+
 export const startConsumerLoop = async () => {
-  console.log(`[Consumer Engine] Resilient poller online. Listening as: ${CONSUMER_NAME}`);
+  console.log(`[Consumer Engine] Resilient telemetry poller online. Listening as: ${CONSUMER_NAME}`);
+  
+  // Start tracking the live background DLQ metric gauge sweep on a steady timer
+  setInterval(updateDlqMetrics, 10000);
 
   while (true) {
     let currentMessageId = null;
@@ -96,23 +114,37 @@ export const startConsumerLoop = async () => {
 
       console.log(`[Consumer Engine] Acquired Job ID: ${messageId} (Attempt ${attempts}/${MAX_ATTEMPTS})`);
 
+      // Set Telemetry State: Increment active concurrent worker execution allocations
+      activeJobsGauge.inc();
+      
+      // Start processing performance duration stopwatch tracking
+      const endTimer = notificationProcessingDuration.startTimer({ type: notificationType });
+
       try {
         await processNotificationJob(notificationType, payload);
         
-        // Success path: settle and clear state counters
+        // Success Path Telemetry Allocation
+        endTimer();
+        activeJobsGauge.dec();
+        notificationsProcessedTotal.inc({ status: 'success', type: notificationType });
+
         await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
         await redis.del(trackingKey);
         console.log(`[Consumer Engine] Job ID: ${messageId} settled successfully (XACK).`);
 
       } catch (jobExecutionError) {
+        // Failure Path Telemetry Allocation
+        endTimer();
+        activeJobsGauge.dec();
+        notificationsProcessedTotal.inc({ status: 'failed', type: notificationType });
+
         if (attempts >= MAX_ATTEMPTS) {
           await routeToDeadLetterQueue(messageId, notificationType, payload, jobExecutionError.message);
           await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
           await redis.del(trackingKey);
+          await updateDlqMetrics(); // Instantly refresh the DLQ gauge metric state
         } else {
-          // Move the job to the Sorted Set delay layer
           await scheduleExponentialBackoff(messageId, notificationType, payload, attempts);
-          // Acknowledge the current stream item since a copy is securely parked in the ZSET
           await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
         }
       }

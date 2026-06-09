@@ -1,6 +1,7 @@
 import { initializeConsumerGroup, startConsumerLoop } from './src/services/consumerEngine.js';
 import { startRecoveryAgent } from './src/services/recoveryService.js';
 import { startSchedulerDaemon } from './src/services/schedulerService.js';
+import { startMetricsServer } from './src/services/metricsService.js';
 
 console.log('[Worker] Launching headless consumer background processes...');
 
@@ -9,6 +10,8 @@ const startWorkerContext = async () => {
     // 1. Establish structural cluster group state
     await initializeConsumerGroup();
 
+    startMetricsServer(9100);  // Launch Prometheus metric scraper listener channel node
+    
     // 2. Launch autonomous stalled job recovery loop agent (runs on background timer)
     startRecoveryAgent();
 
