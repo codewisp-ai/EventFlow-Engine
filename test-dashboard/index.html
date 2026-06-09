@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VortexMQ Ingestion Streaming Monitor</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 40px; }
+    .card { background: #1e293b; padding: 24px; border-radius: 8px; max-width: 500px; margin-bottom: 20px; border: 1px solid #334155; }
+    button { background: #3b82f6; color: white; border: none; padding: 10px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    button:hover { background: #2563eb; }
+    input { background: #0f172a; border: 1px solid #475569; color: white; padding: 10px; border-radius: 4px; width: calc(100% - 24px); margin-bottom: 12px; }
+    .status-badge { display: inline-block; padding: 6px 12px; border-radius: 4px; font-weight: bold; margin-top: 10px; background: #475569; }
+    .processing { background: #eab308; color: #0f172a; }
+    .delivered { background: #22c55e; color: white; }
+    .retrying { background: #f97316; color: white; }
+    .failed_dlq { background: #ef4444; color: white; }
+  </style>
+</head>
+<body>
+  <h2>VortexMQ Pipeline Execution Stream</h2>
+  <div class="card">
+    <h3>Trigger Event Log</h3>
+    <label>Recipient Contact Mapping:</label>
+    <input type="text" id="recipient" value="elite-engineer@example.com">
+    <button onclick="dispatchNotification()">Fire Event Payload</button>
+  </div>
+  <div class="card">
+    <h3>Live Tracking Feedback</h3>
+    <div>Job Reference String: <strong id="job-id-text">None Active</strong></div>
+    <div id="status-badge" class="status-badge">Awaiting Input...</div>
+    <p id="details-text" style="color: #94a3b8; font-size: 14px;"></p>
+  </div>
+
+  <script>
+    // Open full duplex socket streaming tunnel straight to our backend server api port mapping
+    const socket = io('http://localhost:8080');
+
+    socket.on('job_update', (data) => {
+      console.log('Intercepted streaming socket update data packet:', data);
+      document.getElementById('status-badge').innerText = data.status.toUpperCase();
+      document.getElementById('status-badge').className = `status-badge ${data.status}`;
+      document.getElementById('details-text').innerText = JSON.stringify(data.details, null, 2);
+    });
+
+    async function dispatchNotification() {
+      const recipient = document.getElementById('recipient').value;
+      
+      // Reset tracking view
+      document.getElementById('job-id-text').innerText = 'Queuing...';
+      document.getElementById('status-badge').innerText = 'QUEUED';
+      document.getElementById('status-badge').className = 'status-badge';
+      document.getElementById('details-text').innerText = '';
+
+      const response = await fetch('http://localhost:8080/api/v1/notifications/trigger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'email', payload: { recipient, body: 'Streaming Sandbox Broadcast' } })
+      });
+
+      const result = await response.json();
+      const jobId = result.jobId;
+      
+      document.getElementById('job-id-text').innerText = jobId;
+      
+      // Register subscription room lock straight down the open socket channel
+      socket.emit('subscribe_job', jobId);
+    }
+  </script>
+</body>
+</html>

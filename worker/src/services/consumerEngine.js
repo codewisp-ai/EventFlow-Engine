@@ -13,6 +13,22 @@ const MAX_ATTEMPTS = 5;
 const BASE_DELAY_MS = 1000; // Start with 1 second base delay
 const MAX_DELAY_MS = 60000; // Cap backoff intervals at 60 seconds
 
+const pubClient = createRedisClient('worker_pub_bus');
+const PUB_SUB_CHANNEL = 'job:status:updates';
+
+/**
+ * Atomically broadcasts job lifecycle updates onto our cross-container infrastructure bus.
+ */
+const broadcastJobStatus = async (jobId, status, details = {}) => {
+  try {
+    const payload = JSON.stringify({ jobId, status, ...details });
+    await pubClient.publish(PUB_SUB_CHANNEL, payload);
+    console.log(`[Pub/Sub Bus] Broadcasted status update for Job ${jobId}: ${status}`);
+  } catch (err) {
+    console.error('[Pub/Sub Bus] Critical failure broadcasting event state update:', err.message);
+  }
+};
+
 export const initializeConsumerGroup = () => {
   return new Promise((resolve, reject) => {
     const executeGroupCreation = async () => {
@@ -83,6 +99,49 @@ export const startConsumerLoop = async () => {
   setInterval(updateDlqMetrics, 10000);
 
   while (true) {
+      console.log(`[Consumer Engine] Acquired Job ID: ${messageId} (Attempt ${attempts}/${MAX_ATTEMPTS})`);
+      
+      // State Mutation 1: Notify client that the task has been pulled out of the queue and is now running
+      await broadcastJobStatus(messageId, 'processing');
+
+      activeJobsGauge.inc();
+      const endTimer = notificationProcessingDuration.startTimer({ type: notificationType });
+
+      try {
+        await processNotificationJob(notificationType, payload);
+        
+        endTimer();
+        activeJobsGauge.dec();
+        notificationsProcessedTotal.inc({ status: 'success', type: notificationType });
+
+        await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
+        await redis.del(trackingKey);
+        
+        // State Mutation 2: Notify client that processing succeeded and the job is settled
+        await broadcastJobStatus(messageId, 'delivered', { recipient: payload.recipient });
+        console.log(`[Consumer Engine] Job ID: ${messageId} settled successfully (XACK).`);
+
+      } catch (jobExecutionError) {
+        endTimer();
+        activeJobsGauge.dec();
+        notificationsProcessedTotal.inc({ status: 'failed', type: notificationType });
+
+        if (attempts >= MAX_ATTEMPTS) {
+          await routeToDeadLetterQueue(messageId, notificationType, payload, jobExecutionError.message);
+          await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
+          await redis.del(trackingKey);
+          await updateDlqMetrics();
+          
+          // State Mutation 3: Notify client that retry attempts failed and the item is isolated in the DLQ
+          await broadcastJobStatus(messageId, 'failed_dlq', { reason: jobExecutionError.message });
+        } else {
+          await scheduleExponentialBackoff(messageId, notificationType, payload, attempts);
+          await redis.xack(STREAM_KEY, CONSUMER_GROUP, messageId);
+          
+          // State Mutation 4: Notify client that a temporary error occurred and a delayed retry is scheduled
+          await broadcastJobStatus(messageId, 'retrying', { attempt: attempts, nextIn: `${Math.min(BASE_DELAY_MS * Math.pow(2, attempts), MAX_DELAY_MS)}ms` });
+        }
+      }
     let currentMessageId = null;
     let notificationType = null;
     let payload = null;
